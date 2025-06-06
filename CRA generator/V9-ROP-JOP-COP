@@ -1,0 +1,358 @@
+################################################
+# Capstone should be install before execute this code #
+#!pip install capstone
+#https://www.capstone-engine.org/
+#################################################
+
+import json
+import pickle
+import random
+import csv
+from datetime import datetime
+from capstone import Cs, CS_ARCH_RISCV, CS_MODE_RISCV64, CS_MODE_RISCVC
+
+
+
+
+
+def extract_metadata(block_addr, instructions, gtype):
+    opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+    hexcodes = [instr for instr in instructions if instr.startswith("hex")]
+    terminator = opcodes[-1].split()[1] if opcodes else "unknown"
+    
+    return {
+        "address": block_addr,
+        "type": gtype,
+        "instruction_count": len(opcodes),
+        "instructions": "; ".join(opcodes),
+        "hex_codes": "; ".join(hexcodes),
+        "terminator": terminator,
+        "source_dataset": software,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+
+
+dataframes = []
+
+# Inicializa Capstone com suporte a instruções comprimidas
+md = Cs(CS_ARCH_RISCV, CS_MODE_RISCV64 | CS_MODE_RISCVC)
+
+# Função para limpar prefixo 'c.' do opcode
+
+#def clean_opcode_string(opcode_string):
+ #   if opcode_string.startswith("opcode c."):
+  #      return opcode_string.replace("opcode c.", "opcode ")
+   # return opcode_string
+
+# Função corrigida para disassemblar hex corretamente (validada com exemplo funcional)
+def disassemble_hex_riscv(hex_code, addr):
+    hex_clean = hex_code[2:] if hex_code.startswith("0x") else hex_code
+    hex_clean = hex_clean.zfill(4 if len(hex_clean) <= 4 else 8)
+    code_bytes = bytes.fromhex(hex_clean)[::-1]
+    code_bytes = code_bytes[:4]
+    try:
+        disasm = list(md.disasm(code_bytes, addr))
+        if disasm:
+            instr = disasm[0]
+            return f"opcode {instr.mnemonic} {instr.op_str}".strip(), code_bytes[:instr.size], instr.size
+    except Exception as e:
+        print(f"[Erro] {hex_code} @ {addr:x} → {e}")
+    return "opcode unknown", code_bytes, 0
+
+
+blocks = data["blocks"]
+trace = data["trace"]
+blocks_data = {}
+unrecognized = []
+
+for block in blocks:
+    block_addr = block["addr"]
+    insns_addr = block["insns_addr"]
+    insns_data = block["insns_data"]
+    sequence = []
+
+    for addr, hexcode in zip(insns_addr, insns_data):
+        addr_int = int(addr, 16)
+        opcode_raw, code_bytes, instr_size = disassemble_hex_riscv(hexcode, addr_int)
+        opcode = opcode_raw.lower()
+        #opcode = clean_opcode_string(opcode_raw)
+        hex_str = "hex " + " ".join(f"{b:02x}" for b in code_bytes[:instr_size])
+        sequence.extend([addr, opcode, hex_str])
+        if "unknown" in opcode:
+            unrecognized.append((addr, hex_str))
+
+    if sequence:
+        blocks_data[block_addr] = sequence
+
+with open(f"blocksdata{software}.pickle", "wb") as f:
+    pickle.dump(blocks_data, f)
+
+with open("unrecognized"+software+".txt", "w") as f:
+    for addr, hexline in unrecognized:
+        f.write(f"{addr}: {hexline}\n")
+print(f"✅ Corrigido: {len(unrecognized)} instruções não reconhecidas. Arquivo salvo.")
+
+with open("blocks_data"+software+".txt", "w") as f:
+    for key, value in blocks_data.items():
+        f.write(f"{key}: {value}\n")
+print("blocks_data saved to ", software," blocks_data.txt")
+
+
+# Construir adjlist
+direct_types = {"direct_call", "direct_jump_without_linkage", "not_taken_branch", "taken_branch"}
+indirect_types = {"function_return", "indirect_call", "indirect_jump_without_linkage", "other_indirect_jump_with_linkage", "Exception", "None"}
+adjlist = {}
+for entry in trace:
+    src, dst, jump_type = entry["from"], entry["to"], entry["type"].strip()
+    edge_type = "diretto" if jump_type in direct_types else "indiretto" if jump_type in indirect_types else None
+    if edge_type:
+        adjlist.setdefault(src, []).append((edge_type, dst))
+
+with open(f"adjlist{software}.pickle", "wb") as f:
+    pickle.dump(adjlist, f)
+print(f"✅ adjlist gerada com sucesso com {len(adjlist)} blocos conectados.")
+
+
+
+
+gadgets_metadata = []
+# Gera s1
+s1, s1_set = [], set()
+
+
+def add_chain(chain):
+    key = tuple(chain)
+    if key not in s1_set:
+        s1.append(chain)
+        s1_set.add(key)
+
+for src, edges in adjlist.items():
+    for edge_type, dst in edges:
+        if edge_type == 'diretto':
+            if dst in adjlist:
+                for edge2_type, dst2 in adjlist[dst]:
+                    if edge2_type == 'diretto':
+                        add_chain([src, dst, dst2])
+                        if dst2 in adjlist:
+                            for edge3_type, dst3 in adjlist[dst2]:
+                                add_chain([dst2, dst3])
+                                break
+                        break
+                else:
+                    add_chain([src, dst])
+            else:
+                add_chain([src, dst])
+        else:
+            add_chain([src, dst])
+
+with open(f"s1{software}.pickle", "wb") as f:
+    pickle.dump(s1, f)
+#print(f"✅ s1 gerado com {len(s1)} cadeias benignas.")    
+print(f"✅ s1 gerado com {len(s1)} cadeias e {len(set(x for chain in s1 for x in chain))} blocos únicos.")
+
+# Gera s2 (gadgets maliciosos)
+
+s1_set = set(tuple(pair) for pair in s1)
+s2 = []
+MAX_INSTRUCTIONS_PER_BLOCK = 5
+MAX_CONNECTIONS = 3
+
+
+# === Identificar gadgets maliciosos plausíveis ===
+# === Identificar gadgets ROP plausíveis ===
+rop_gadgets = []
+jop_gadgets = []
+cop_gadgets = []
+
+ROP_TERMINATORS = ["ret", "retn", "jr ra", "jalr ra", "c.jr ra"]
+JOP_TERMINATORS = ["jalr", "c.jalr", "jr", "c.jr", "jalr t1", "jr t1"]
+COP_TERMINATORS = ["call", "ecall", "scall", "fcall", "jal x1", "jal x0", "c.jal", "c.jalr"]
+
+def is_rop_gadget(instr_list):
+    if len(instr_list) > MAX_INSTRUCTIONS_PER_BLOCK:
+        return False
+    for i in range(len(instr_list) - 1, -1, -1):
+        opcode = instr_list[i].lower()
+        if any(term in opcode for term in ROP_TERMINATORS):
+            return True
+    return False
+
+for block_addr, instructions in blocks_data.items():
+    opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+    if is_rop_gadget(opcodes):
+        rop_gadgets.append(block_addr)
+        # Recupera os opcodes do bloco
+        opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+        instr_summary = "; ".join(opcodes)
+        print(f"🔍 Gadget ROP encontrado: {block_addr} → {instr_summary}")
+
+
+def is_jop_gadget(instr_list):
+    if len(instr_list) > MAX_INSTRUCTIONS_PER_BLOCK:
+        return False
+    for i in range(len(instr_list) - 1, -1, -1):
+        opcode = instr_list[i].lower()
+        if any(term in opcode for term in JOP_TERMINATORS):
+            return True
+    return False
+
+
+# Identificar gadgets JOP plausíveis
+for block_addr, instructions in blocks_data.items():
+    opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+    if is_jop_gadget(opcodes):
+        jop_gadgets.append(block_addr)
+        # Recupera os opcodes do bloco
+        opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+        instr_summary = "; ".join(opcodes)
+        print(f"🔍 Gadget JOP encontrado: {block_addr} → {instr_summary}")
+
+
+
+def is_cop_gadget(instr_list):
+    if len(instr_list) > MAX_INSTRUCTIONS_PER_BLOCK:
+        return False
+    for i in range(len(instr_list) - 1, -1, -1):
+        opcode = instr_list[i].lower()
+        if any(term in opcode for term in COP_TERMINATORS):
+            return True
+    return False
+
+for block_addr, instructions in blocks_data.items():
+    opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+    if is_cop_gadget(opcodes):
+        cop_gadgets.append(block_addr)
+        # Recupera os opcodes do bloco
+        opcodes = [instr for instr in instructions if instr.startswith("opcode")]
+        instr_summary = "; ".join(opcodes)
+        print(f"🔍 Gadget COP encontrado: {block_addr} → {instr_summary}")
+
+
+# Criando rastreabilidade
+for block_addr in rop_gadgets:
+    instructions = blocks_data[block_addr]
+    gadgets_metadata.append(extract_metadata(block_addr, instructions, "ROP"))
+
+for block_addr in jop_gadgets:
+    instructions = blocks_data[block_addr]
+    gadgets_metadata.append(extract_metadata(block_addr, instructions, "JOP"))
+
+for block_addr in cop_gadgets:
+    instructions = blocks_data[block_addr]
+    gadgets_metadata.append(extract_metadata(block_addr, instructions, "COP"))
+
+
+
+
+
+#rop_gadgets = {dst for src, edges in adjlist.items() for edge_type, dst in edges if edge_type.strip() != "diretto"}
+
+from_blocks = list(blocks_data.keys())
+
+s2_rop, s2_jop = [], []
+s2_cop = []
+
+s2_set=set()
+max_chains = len(s1)
+target_total_attacks = len(s1)  # 50% do dataset será malicioso
+target_rop = target_total_attacks // 3
+target_jop = target_total_attacks // 3
+target_cop = target_total_attacks - target_rop - target_jop  # para somar exatamente 50%
+
+max_pairs = len(s1)
+
+def is_connected(a, b):
+    return (a in adjlist and any(b == tgt for _, tgt in adjlist[a])) or (b in adjlist and any(a == tgt for _, tgt in adjlist[b]))
+
+def is_low_connectivity(block):
+    return len(adjlist.get(block, [])) <= MAX_CONNECTIONS
+
+random.seed(42)
+
+# Gerar s2 até atingir o número máximo de pares
+# Geração da cadeia maliciosa s2 como sequência de gadgets ROP encadeados
+s2 = []
+max_chains = len(s1)
+
+random.seed(42)
+
+# === Geração de cadeias ROP ===
+while len(s2_rop) < target_rop:
+    chain = random.sample(rop_gadgets, k=3)
+
+    if any((a, b) in s1_set or (b, a) in s1_set for a, b in zip(chain, chain[1:])):
+        continue
+    if len(set(chain)) != len(chain):
+        continue
+    if any(not is_low_connectivity(block) for block in chain):
+        continue
+    key = tuple(chain)
+    if key in s2_set:
+        continue
+    s2_set.add(key)
+    s2_rop.append(chain)
+
+
+# === Geração de cadeias JOP ===
+while len(s2_jop) < target_jop:
+    chain = random.sample(jop_gadgets, k=3)
+
+    if any((a, b) in s1_set or (b, a) in s1_set for a, b in zip(chain, chain[1:])):
+        continue
+    if len(set(chain)) != len(chain):
+        continue
+    if any(not is_low_connectivity(block) for block in chain):
+        continue
+    key = tuple(chain)
+    if key in s2_set:
+        continue
+    s2_set.add(key)
+    s2_jop.append(chain)
+
+# === Geração de cadeias COP ===
+while len(s2_cop) < target_cop:
+    chain = random.sample(cop_gadgets, k=3)
+
+    if any((a, b) in s1_set or (b, a) in s1_set for a, b in zip(chain, chain[1:])):
+        continue
+    if len(set(chain)) != len(chain):
+        continue
+    if any(not is_low_connectivity(block) for block in chain):
+        continue
+    key = tuple(chain)
+    if key in s2_set:
+        continue
+    s2_set.add(key)
+    s2_cop.append(chain)
+
+
+
+
+# Concatenar os dois tipos de ataque
+s2 = s2_rop + s2_jop + s2_cop
+# Remover duplicatas
+#s2 = list(set(tuple(chain) for chain in s2))
+# Converter de volta para lista de listas
+# s2 = [list(chain) for chain in s2]
+
+
+    
+
+with open(f"s2{software}.pickle", "wb") as f:
+    pickle.dump(s2, f)
+
+
+print(f"✅ s2 final gerado com {len(s2)} cadeias maliciosas (ROP: {len(s2_rop)}, JOP: {len(s2_jop)}).")
+
+
+csv_filename = f"gadgets_metadata_{software}.csv"
+with open(csv_filename, "w", newline="") as csvfile:
+    fieldnames = ["address", "type", "instruction_count", "instructions", "hex_codes", "terminator", "source_dataset", "timestamp"]
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in gadgets_metadata:
+        writer.writerow(row)
+
+print(f"✅ CSV com metadados dos gadgets salvo em {csv_filename}")
