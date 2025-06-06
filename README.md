@@ -24,3 +24,7 @@ This repository serves as the foundation for experiments involving:
 - DNN-based detection  
 
 with a focus on **lightweight** and **generalizable** methods for **embedded environments**.
+
+
+
+Author Contact: Júnia Maísa - junia.deoliveira@unibo.it
