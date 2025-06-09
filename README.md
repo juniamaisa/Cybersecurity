@@ -15,6 +15,9 @@ The experiments are based on execution traces of **RISC-V** binaries and the app
   Includes raw data extracted directly from the execution of **RISC-V** binaries using **QEMU** (`qemu-riscv64`, version 9.2.3).  
   The data contains instruction-level traces and control-flow transitions used in the simulation and training pipeline.
 
+- `Data_processed/`  
+  Includes .pickle dataset generated using the code generator available in `CRA_generator/`.
+
 ---
 
 This repository serves as the foundation for experiments involving:
